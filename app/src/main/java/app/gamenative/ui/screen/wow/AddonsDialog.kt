@@ -297,7 +297,7 @@ private fun MyAddonsTab(gameRoot: File) {
                     when (record?.provider) {
                         Provider.WOWINTERFACE -> WowInterfaceProvider.details(record.id)
                         Provider.TUKUI -> TukuiProvider.details(record.id)
-                        Provider.GITHUB -> GitHubProvider.details(GitHubProvider.parseRepo("github.com/${record.id}") ?: error("Bad repository"))
+                        Provider.GITHUB -> GitHubProvider.details(GitHubProvider.repoOfRecord(record.id) ?: error("Bad repository"))
                         else -> localDetails(addon, record)
                     }
                 }

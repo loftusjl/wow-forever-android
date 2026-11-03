@@ -51,9 +51,12 @@ import app.gamenative.addons.AddonSites
 import app.gamenative.addons.AddonSort
 import app.gamenative.addons.AddonSources
 import app.gamenative.addons.CatalogAddon
+import app.gamenative.addons.GitHubProduct
 import app.gamenative.addons.Provider
 import app.gamenative.addons.TukuiProvider
 import app.gamenative.addons.WowInterfaceProvider
+import app.gamenative.addons.formatBytes
+import app.gamenative.addons.selectionWarnings
 import app.gamenative.ui.theme.WowBronze
 import app.gamenative.ui.theme.WowError
 import app.gamenative.ui.theme.WowGold
@@ -61,6 +64,7 @@ import app.gamenative.ui.theme.WowMuted
 import app.gamenative.ui.theme.WowSubtle
 import java.io.File
 import java.text.NumberFormat
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -298,9 +302,83 @@ internal fun ColumnScope.UrlTab(gameRoot: File) {
     var busy by remember { mutableStateOf(false) }
     var message by remember { mutableStateOf<String?>(null) }
     var failed by remember { mutableStateOf(false) }
+    var choices by remember { mutableStateOf<List<GitHubProduct>?>(null) }
+    var selected by remember { mutableStateOf(emptySet<String>()) }
+    var progress by remember { mutableStateOf<String?>(null) }
+    var conflict by remember { mutableStateOf<Pair<AddonInstaller.InstallConflict, CompletableDeferred<Boolean>>?>(null) }
+
+    fun installSingle() {
+        busy = true
+        message = null
+        scope.launch {
+            try {
+                val folders = withContext(Dispatchers.IO) { AddonInstaller.installFromUrl(gameRoot, context.cacheDir, url) }
+                failed = false
+                message = "Installed ${folders.joinToString(", ")}"
+                url = ""
+            } catch (e: Exception) {
+                failed = true
+                message = "Couldn't install: ${e.message}"
+            }
+            busy = false
+        }
+    }
+
+    fun installSelected(products: List<GitHubProduct>) {
+        val chosen = products.filter { it.prefix in selected }
+        if (chosen.isEmpty()) return
+        busy = true
+        message = null
+        scope.launch {
+            try {
+                val results = withContext(Dispatchers.IO) {
+                    AddonInstaller.installProducts(
+                        gameRoot, context.cacheDir, url, chosen,
+                        onProgress = { i, n, p -> progress = "Installing ${i + 1} of $n: ${p.prefix.ifEmpty { p.assetName }}…" },
+                        confirmReplace = { c ->
+                            val answer = CompletableDeferred<Boolean>()
+                            conflict = c to answer
+                            try { answer.await() } finally { conflict = null }
+                        },
+                    )
+                }
+                failed = results.any { it.error != null }
+                message = results.joinToString("\n") { r ->
+                    val label = r.product.prefix.ifEmpty { r.product.assetName }
+                    when {
+                        r.error != null -> "$label: couldn't install (${r.error})"
+                        r.skipped -> "$label: skipped, nothing was replaced"
+                        else -> "$label: installed ${r.folders.joinToString(", ")}"
+                    }
+                }
+                if (results.any { it.error == null && !it.skipped }) url = ""
+                choices = null
+            } catch (e: Exception) {
+                failed = true
+                message = "Couldn't install: ${e.message}"
+            }
+            progress = null
+            busy = false
+        }
+    }
+
+    val offered = choices
+    if (offered != null) {
+        ProductChooser(
+            repo = url.trim(), products = offered, selected = selected,
+            onToggle = { p -> selected = if (p.prefix in selected) selected - p.prefix else selected + p.prefix },
+            gameFree = gameRoot.usableSpace, cacheFree = context.cacheDir.usableSpace,
+            busy = busy, progress = progress, conflict = conflict?.first,
+            onAnswer = { replace -> conflict?.second?.complete(replace) },
+            onInstall = { installSelected(offered) },
+            onCancel = { choices = null; message = null },
+        )
+        message?.let { Text(it, fontSize = 13.sp, color = if (failed) WowError else WowGold, modifier = Modifier.padding(top = 10.dp)) }
+        return
+    }
 
     Text(
-        "Paste a GitHub repository (its latest release zip is installed) or a direct https link to an addon zip.",
+        "Paste a GitHub repository (its latest release zip is installed, or you pick which to install if it publishes several) or a direct https link to an addon zip.",
         fontSize = 13.sp, color = WowMuted,
     )
     Spacer(modifier = Modifier.size(8.dp))
@@ -321,16 +399,19 @@ internal fun ColumnScope.UrlTab(gameRoot: File) {
                 busy = true
                 message = null
                 scope.launch {
-                    try {
-                        val folders = withContext(Dispatchers.IO) { AddonInstaller.installFromUrl(gameRoot, context.cacheDir, url) }
-                        failed = false
-                        message = "Installed ${folders.joinToString(", ")}"
-                        url = ""
-                    } catch (e: Exception) {
-                        failed = true
-                        message = "Couldn't install: ${e.message}"
+                    // A repo that publishes several products (a monorepo) lets you pick; anything else installs straight away.
+                    val products = try {
+                        withContext(Dispatchers.IO) { AddonInstaller.githubProducts(url) }
+                    } catch (_: Exception) {
+                        null // the install below reports the real error
                     }
-                    busy = false
+                    if (products != null && products.size > 1) {
+                        selected = products.filter { it.isDefault }.map { it.prefix }.toSet()
+                        choices = products
+                        busy = false
+                    } else {
+                        installSingle()
+                    }
                 }
             },
             enabled = url.isNotBlank() && !busy,
@@ -340,6 +421,117 @@ internal fun ColumnScope.UrlTab(gameRoot: File) {
         if (busy) CircularProgressIndicator(color = WowGold, modifier = Modifier.padding(start = 12.dp).size(24.dp))
     }
     message?.let { Text(it, fontSize = 13.sp, color = if (failed) WowError else WowGold, modifier = Modifier.padding(top = 10.dp)) }
+}
+
+/**
+ * A repo that publishes several products: tick the ones to install. The product that matches the repo's name comes
+ * first as recommended, and translations are tucked away. While a batch runs, a product that would replace folders
+ * that are already installed pauses it here for a replace-or-skip answer.
+ */
+@Composable
+private fun ColumnScope.ProductChooser(
+    repo: String,
+    products: List<GitHubProduct>,
+    selected: Set<String>,
+    onToggle: (GitHubProduct) -> Unit,
+    gameFree: Long,
+    cacheFree: Long,
+    busy: Boolean,
+    progress: String?,
+    conflict: AddonInstaller.InstallConflict?,
+    onAnswer: (Boolean) -> Unit,
+    onInstall: () -> Unit,
+    onCancel: () -> Unit,
+) {
+    if (conflict != null) {
+        ConflictPrompt(conflict, onAnswer)
+        return
+    }
+    var showLanguages by remember { mutableStateOf(false) }
+    val translations = products.filter { it.locale != null }
+    // Translations are tucked away unless they're all there is.
+    val shown = if (showLanguages || translations.size == products.size) products else products - translations.toSet()
+    val chosen = products.filter { it.prefix in selected }
+    val name = repo.removePrefix("https://").removePrefix("http://").removePrefix("www.")
+    val warnings = selectionWarnings(chosen, gameFree, cacheFree)
+    val total = chosen.sumOf { it.sizeBytes }
+    Text("$name publishes ${shown.size} separate downloads. Tick the ones to install.", fontSize = 13.sp, color = WowMuted)
+    Spacer(modifier = Modifier.size(8.dp))
+    // The list gets all the room the buttons leave: the size is on the install button and only "no room" warnings stay pinned.
+    LazyColumn(modifier = Modifier.weight(1f, fill = false), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        items(warnings.filter { !it.serious }, key = { it.text }) { Text(it.text, fontSize = 12.sp, color = WowGold) }
+        items(shown, key = { it.prefix }) { product ->
+            val checked = product.prefix in selected
+            Row(
+                modifier = Modifier.fillMaxWidth().focusGlow(14.dp)
+                    .background(if (checked) Color(0xFF33405A) else Color(0xFF252B3B), RoundedCornerShape(14.dp))
+                    .clickable(enabled = !busy) { onToggle(product) }
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Checkbox(checked = checked, onCheckedChange = null, colors = CheckboxDefaults.colors(checkedColor = WowBronze))
+                Column(modifier = Modifier.padding(start = 12.dp).fillMaxWidth()) {
+                    Row(verticalAlignment = Alignment.Bottom) {
+                        Text(product.prefix.ifEmpty { product.assetName }, fontWeight = FontWeight.Bold, color = Color.White)
+                        val notes = listOfNotNull(if (product.isDefault) "recommended" else null, if (product.isLarge) "large download" else null)
+                        if (notes.isNotEmpty()) Text(notes.joinToString(" · "), fontSize = 12.sp, color = WowGold, modifier = Modifier.padding(start = 10.dp, bottom = 2.dp))
+                    }
+                    Text(
+                        listOf(product.tag.substringAfterLast('/'), product.assetName, product.sizeLabel).filter { it.isNotEmpty() }.joinToString("  ·  "),
+                        fontSize = 12.sp, color = Color(0xFFE2E8F0), maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+        }
+    }
+    for (warning in warnings.filter { it.serious }) {
+        Text(warning.text, fontSize = 12.sp, color = WowError, modifier = Modifier.padding(top = 4.dp))
+    }
+    Spacer(modifier = Modifier.size(6.dp))
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Button(
+            modifier = Modifier.focusGlow(14.dp),
+            onClick = onInstall,
+            enabled = chosen.isNotEmpty() && !busy,
+            colors = ButtonDefaults.buttonColors(containerColor = WowBronze, contentColor = Color.White),
+            shape = RoundedCornerShape(14.dp),
+        ) {
+            val label = (if (chosen.size > 1) "INSTALL ${chosen.size} SELECTED" else "INSTALL") + if (total > 0) " · ${formatBytes(total)}" else ""
+            Text(label, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+        }
+        TextButton(modifier = Modifier.focusGlow(14.dp), onClick = onCancel, enabled = !busy) { Text("CANCEL", color = WowMuted) }
+        if (translations.isNotEmpty() && translations.size < products.size) {
+            TextButton(modifier = Modifier.focusGlow(14.dp), onClick = { showLanguages = !showLanguages }, enabled = !busy) {
+                Text(if (showLanguages) "HIDE OTHER LANGUAGES" else "SHOW ${translations.size} OTHER LANGUAGES", color = WowGold)
+            }
+        }
+        if (busy) CircularProgressIndicator(color = WowGold, modifier = Modifier.padding(start = 12.dp).size(24.dp))
+    }
+    progress?.let { Text(it, fontSize = 13.sp, color = WowGold, modifier = Modifier.padding(top = 6.dp)) }
+}
+
+/** The product's folders that already exist, and who put them there: replace them or skip this download. */
+@Composable
+private fun ColumnScope.ConflictPrompt(conflict: AddonInstaller.InstallConflict, onAnswer: (Boolean) -> Unit) {
+    val label = conflict.product.prefix.ifEmpty { conflict.product.assetName }
+    Text("$label would replace addons that are already installed:", fontSize = 14.sp, color = WowGold, fontWeight = FontWeight.Bold)
+    Spacer(modifier = Modifier.size(6.dp))
+    for (c in conflict.folders.take(8)) {
+        Text("•  ${c.folder}  (${c.ownedBy?.let { "from $it" } ?: "added by hand or imported"})", fontSize = 13.sp, color = Color(0xFFE2E8F0))
+    }
+    if (conflict.folders.size > 8) Text("…and ${conflict.folders.size - 8} more", fontSize = 13.sp, color = WowMuted)
+    Spacer(modifier = Modifier.size(6.dp))
+    Text("Replacing deletes those folders first. Skip keeps what you have and moves on to the next download.", fontSize = 12.sp, color = WowMuted)
+    Spacer(modifier = Modifier.size(10.dp))
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Button(
+            modifier = Modifier.focusGlow(14.dp),
+            onClick = { onAnswer(true) },
+            colors = ButtonDefaults.buttonColors(containerColor = WowBronze, contentColor = Color.White),
+            shape = RoundedCornerShape(14.dp),
+        ) { Text("REPLACE", fontWeight = FontWeight.Bold, letterSpacing = 1.sp) }
+        TextButton(modifier = Modifier.focusGlow(14.dp), onClick = { onAnswer(false) }) { Text("SKIP THIS ONE", color = WowMuted) }
+    }
 }
 
 /** "v" is only added to bare numbers; some sources already include it (e.g. "v4.3.13-release"). */

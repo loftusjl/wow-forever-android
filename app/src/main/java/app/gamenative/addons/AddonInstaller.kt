@@ -4,6 +4,7 @@ import app.gamenative.utils.Net
 import java.io.File
 import java.io.IOException
 import java.security.MessageDigest
+import kotlinx.coroutines.CancellationException
 import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
@@ -130,6 +131,81 @@ object AddonInstaller {
         return install(gameRoot, cacheDir, addon.provider, addon.id, addon.name, file)
     }
 
+    /** A folder an install would replace, and what tracked it: null when it was put there by hand or imported. */
+    data class FolderConflict(val folder: String, val ownedBy: String?)
+
+    /**
+     * Whether [owner] is the same GitHub product as [id]. A record made before products had their own ids is the repo's
+     * plain "owner/repo", with the product in its tag ("spoken/v3.8.0"), so that counts as the product "owner/repo#spoken".
+     */
+    private fun isSameProduct(owner: SourceRecord, id: String): Boolean {
+        if (owner.provider != Provider.GITHUB) return false
+        if (owner.id == id) return true
+        val prefix = id.substringAfter('#', "")
+        return prefix.isNotEmpty() && owner.id == id.substringBefore('#') && GitHubProvider.tagPrefix(owner.version) == prefix
+    }
+
+    /** What installing [folders] under [id] would overwrite. Reinstalling the same product is not a conflict. */
+    fun findConflicts(existing: Set<String>, owners: List<SourceRecord>, id: String, folders: List<String>): List<FolderConflict> =
+        folders.filter { it in existing }.mapNotNull { folder ->
+            val owner = owners.firstOrNull { folder in it.folders }
+            if (owner != null && isSameProduct(owner, id)) null else FolderConflict(folder, owner?.name)
+        }
+
+    /** One product's folders that clash with what is installed, for the user to confirm. */
+    data class InstallConflict(val product: GitHubProduct, val folders: List<FolderConflict>)
+
+    /** What happened to one product of a batch. [skipped] means the user declined a replacement. */
+    data class ProductResult(val product: GitHubProduct, val folders: List<String>, val skipped: Boolean = false, val error: String? = null)
+
+    /**
+     * Installs each of [products] from the GitHub repo [input], one after another, and records each under its own id so
+     * updates track them separately. A zip's folders are read before anything is unpacked; if they would replace
+     * folders that are already there (from another product, another source, or by hand), [confirmReplace] decides.
+     * One product failing does not stop the rest.
+     */
+    suspend fun installProducts(
+        gameRoot: File,
+        cacheDir: File,
+        input: String,
+        products: List<GitHubProduct>,
+        onProgress: (index: Int, total: Int, product: GitHubProduct) -> Unit,
+        confirmReplace: suspend (InstallConflict) -> Boolean,
+    ): List<ProductResult> {
+        val repo = GitHubProvider.parseRepo(input.trim()) ?: throw IOException("Enter a GitHub repository")
+        val results = ArrayList<ProductResult>()
+        for ((index, product) in products.withIndex()) {
+            onProgress(index, products.size, product)
+            val id = GitHubProvider.recordId(repo, product)
+            val zip = File(cacheDir, "addon-download-${System.nanoTime()}.zip")
+            results += try {
+                val file = GitHubProvider.latest(repo, installedTag = product.tag)
+                download(file.url, zip, file.md5)
+                val folders = AddonManager.inspectZip(zip)
+                val addonsDir = AddonManager.addonsDir(gameRoot)
+                val existing = addonsDir.list()?.toSet().orEmpty()
+                val conflicts = findConflicts(existing, AddonSources.load(gameRoot), id, folders)
+                if (conflicts.isNotEmpty() && !confirmReplace(InstallConflict(product, conflicts))) {
+                    ProductResult(product, emptyList(), skipped = true)
+                } else {
+                    val installed = AddonManager.installZip(zip, addonsDir)
+                    AddonSources.record(gameRoot, SourceRecord(Provider.GITHUB, id, "${repo.repo}: ${product.prefix}", file.version, installed, file.assetName))
+                    ProductResult(product, installed)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                ProductResult(product, emptyList(), error = e.message ?: e::class.java.simpleName)
+            } finally {
+                zip.delete()
+            }
+        }
+        return results
+    }
+
+    /** The products a pasted GitHub repo offers, or null when [input] isn't a GitHub repo. More than one means the user should pick. */
+    fun githubProducts(input: String): List<GitHubProduct>? = GitHubProvider.parseRepo(input.trim())?.let { GitHubProvider.products(it) }
+
     /** Installs a GitHub repo's latest release, or a direct https link to a zip. */
     fun installFromUrl(gameRoot: File, cacheDir: File, input: String): List<String> {
         val text = input.trim()
@@ -202,7 +278,7 @@ object AddonInstaller {
         return AddonSources.load(gameRoot).filter { r -> r.folders.any { it in installed } }.mapNotNull { r ->
             val latest = when (r.provider) {
                 Provider.GITHUB -> if (checkGitHub) {
-                    runCatching { GitHubProvider.latest(GitHubProvider.parseRepo("github.com/${r.id}") ?: return@mapNotNull null, r.assetName).version }.getOrNull()
+                    runCatching { GitHubProvider.latest(GitHubProvider.repoOfRecord(r.id) ?: return@mapNotNull null, r.assetName, r.version).version }.getOrNull()
                 } else null
                 Provider.URL -> if (checkGitHub) currentFingerprint(r.id, r.version, cacheDir) else null
                 else -> byKey["${r.provider.key}:${r.id}"]?.version
@@ -214,7 +290,7 @@ object AddonInstaller {
     fun update(gameRoot: File, cacheDir: File, info: UpdateInfo, catalog: List<CatalogAddon>): List<String> {
         val r = info.record
         return when (r.provider) {
-            Provider.GITHUB -> install(gameRoot, cacheDir, r.provider, r.id, r.name, GitHubProvider.latest(GitHubProvider.parseRepo("github.com/${r.id}")!!, r.assetName))
+            Provider.GITHUB -> install(gameRoot, cacheDir, r.provider, r.id, r.name, GitHubProvider.latest(GitHubProvider.repoOfRecord(r.id)!!, r.assetName, r.version))
             Provider.URL -> install(gameRoot, cacheDir, r.provider, r.id, r.name, RemoteFile(r.id, null, info.newVersion))
             else -> installCatalog(gameRoot, cacheDir, catalog.first { it.key == "${r.provider.key}:${r.id}" })
         }
