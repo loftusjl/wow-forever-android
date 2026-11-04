@@ -139,11 +139,15 @@ object AddonManager {
     }
 
     /** Installs each file; a file is deleted only when [deleteAfter] is set and it installed cleanly. */
-    fun importFiles(gameRoot: File, files: List<File>, deleteAfter: Boolean): List<ImportResult> {
+    fun importFiles(gameRoot: File, files: List<File>, deleteAfter: Boolean, gate: OverlapGate = OverlapGate.ALWAYS): List<ImportResult> {
         val addons = addonsDir(gameRoot)
         return files.map { file ->
             try {
+                val incoming = inspectZip(file)
+                AddonInstaller.checkOverlap(gameRoot, null, null, IncomingAddon(incoming.firstOrNull().orEmpty() + if (incoming.size > 1) " +${incoming.size - 1} more" else "", "Imported zip", null, file.name), incoming, gate)
                 val folders = installZip(file, addons)
+                // Imports aren't tracked, so folders they replaced no longer belong to their old source.
+                AddonSources.release(gameRoot, folders)
                 val deleted = deleteAfter && file.delete()
                 ImportResult(file, folders, null, deleted)
             } catch (e: Exception) {
