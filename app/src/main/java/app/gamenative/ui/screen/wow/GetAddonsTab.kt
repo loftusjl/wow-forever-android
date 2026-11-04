@@ -52,6 +52,7 @@ import app.gamenative.addons.AddonSort
 import app.gamenative.addons.AddonSources
 import app.gamenative.addons.CatalogAddon
 import app.gamenative.addons.GitHubProduct
+import app.gamenative.addons.OverlapDeclined
 import app.gamenative.addons.Provider
 import app.gamenative.addons.TukuiProvider
 import app.gamenative.addons.WowInterfaceProvider
@@ -101,6 +102,8 @@ internal fun ColumnScope.GetAddonsTab(gameRoot: File) {
     val busy = remember { mutableStateListOf<String>() }
     var message by remember { mutableStateOf<String?>(null) }
     var detail by remember { mutableStateOf<CatalogAddon?>(null) }
+    val asker = rememberOverlapAsker()
+    OverlapDialog(asker)
 
     fun refreshInstalled() {
         scope.launch {
@@ -134,8 +137,10 @@ internal fun ColumnScope.GetAddonsTab(gameRoot: File) {
         message = null
         scope.launch {
             message = try {
-                val folders = withContext(Dispatchers.IO) { AddonInstaller.installCatalog(gameRoot, context.cacheDir, addon) }
+                val folders = withContext(Dispatchers.IO) { AddonInstaller.installCatalog(gameRoot, context.cacheDir, addon, asker.gate) }
                 "Installed ${addon.name} (${folders.joinToString(", ")})"
+            } catch (e: OverlapDeclined) {
+                "Kept the installed copy; ${addon.name} was not installed"
             } catch (e: Exception) {
                 "Couldn't install ${addon.name}: ${e.message}"
             }
@@ -302,6 +307,8 @@ internal fun ColumnScope.UrlTab(gameRoot: File) {
     var busy by remember { mutableStateOf(false) }
     var message by remember { mutableStateOf<String?>(null) }
     var failed by remember { mutableStateOf(false) }
+    val asker = rememberOverlapAsker()
+    OverlapDialog(asker)
     var choices by remember { mutableStateOf<List<GitHubProduct>?>(null) }
     var selected by remember { mutableStateOf(emptySet<String>()) }
     var progress by remember { mutableStateOf<String?>(null) }
@@ -312,10 +319,13 @@ internal fun ColumnScope.UrlTab(gameRoot: File) {
         message = null
         scope.launch {
             try {
-                val folders = withContext(Dispatchers.IO) { AddonInstaller.installFromUrl(gameRoot, context.cacheDir, url) }
+                val folders = withContext(Dispatchers.IO) { AddonInstaller.installFromUrl(gameRoot, context.cacheDir, url, asker.gate) }
                 failed = false
                 message = "Installed ${folders.joinToString(", ")}"
                 url = ""
+            } catch (e: OverlapDeclined) {
+                failed = false
+                message = e.message
             } catch (e: Exception) {
                 failed = true
                 message = "Couldn't install: ${e.message}"

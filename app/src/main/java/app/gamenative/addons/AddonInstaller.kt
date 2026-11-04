@@ -46,6 +46,13 @@ object AddonSources {
         write(gameRoot, kept + record)
     }
 
+    /** [folders] were replaced by something we don't track: stop claiming them for their old source. */
+    fun release(gameRoot: File, folders: Collection<String>) {
+        val all = load(gameRoot)
+        val kept = all.mapNotNull { r -> r.copy(folders = r.folders - folders.toSet()).takeIf { it.folders.isNotEmpty() } }
+        if (kept != all) write(gameRoot, kept)
+    }
+
     /** Forget records whose folders are all gone, e.g. after a removal. */
     fun prune(gameRoot: File, installedFolders: Set<String>) {
         val all = load(gameRoot)
@@ -110,10 +117,12 @@ object AddonInstaller {
         id: String,
         name: String,
         file: RemoteFile,
+        gate: OverlapGate = OverlapGate.ALWAYS,
     ): List<String> {
         val zip = File(cacheDir, "addon-download-${System.nanoTime()}.zip")
         try {
             download(file.url, zip, file.md5)
+            checkOverlap(gameRoot, provider, id, IncomingAddon(name, provider.label, file.version.takeIf { it.isNotEmpty() }), AddonManager.inspectZip(zip), gate)
             val folders = AddonManager.installZip(zip, AddonManager.addonsDir(gameRoot))
             AddonSources.record(gameRoot, SourceRecord(provider, id, name, file.version, folders, file.assetName))
             return folders
@@ -122,13 +131,22 @@ object AddonInstaller {
         }
     }
 
-    fun installCatalog(gameRoot: File, cacheDir: File, addon: CatalogAddon): List<String> {
+    /** Throws [OverlapDeclined] when [folders] would replace an installed addon and [gate] says no. */
+    fun checkOverlap(gameRoot: File, provider: Provider?, id: String?, incoming: IncomingAddon, folders: List<String>, gate: OverlapGate) {
+        val addons = AddonManager.addonsDir(gameRoot)
+        val existing = folders.filter { File(addons, it).exists() }.toSet()
+        if (existing.isEmpty()) return
+        val groups = AddonOverlaps.find(existing, AddonSources.load(gameRoot), provider, id, folders)
+        if (groups.isNotEmpty() && !gate.allow(OverlapPrompt(incoming, groups))) throw OverlapDeclined(incoming.name)
+    }
+
+    fun installCatalog(gameRoot: File, cacheDir: File, addon: CatalogAddon, gate: OverlapGate = OverlapGate.ALWAYS): List<String> {
         val file = when (addon.provider) {
             Provider.WOWINTERFACE -> WowInterfaceProvider.resolve(addon.id)
             Provider.TUKUI -> RemoteFile(addon.downloadUrl ?: throw IOException("No download for ${addon.name}"), null, addon.version)
             Provider.GITHUB, Provider.URL -> throw IllegalArgumentException("${addon.provider.label} addons install from a URL")
         }
-        return install(gameRoot, cacheDir, addon.provider, addon.id, addon.name, file)
+        return install(gameRoot, cacheDir, addon.provider, addon.id, addon.name, file, gate)
     }
 
     /** A folder an install would replace, and what tracked it: null when it was put there by hand or imported. */
@@ -207,17 +225,18 @@ object AddonInstaller {
     fun githubProducts(input: String): List<GitHubProduct>? = GitHubProvider.parseRepo(input.trim())?.let { GitHubProvider.products(it) }
 
     /** Installs a GitHub repo's latest release, or a direct https link to a zip. */
-    fun installFromUrl(gameRoot: File, cacheDir: File, input: String): List<String> {
+    fun installFromUrl(gameRoot: File, cacheDir: File, input: String, gate: OverlapGate = OverlapGate.ALWAYS): List<String> {
         val text = input.trim()
         val repo = GitHubProvider.parseRepo(text)
         if (repo != null) {
             val file = GitHubProvider.latest(repo)
-            return install(gameRoot, cacheDir, Provider.GITHUB, "${repo.owner}/${repo.repo}", repo.repo, file)
+            return install(gameRoot, cacheDir, Provider.GITHUB, "${repo.owner}/${repo.repo}", repo.repo, file, gate)
         }
         if (!text.startsWith("https://")) throw IOException("Enter a GitHub repository or an https link to a zip")
         val zip = File(cacheDir, "addon-download-${System.nanoTime()}.zip")
         try {
             download(text, zip, null)
+            checkOverlap(gameRoot, Provider.URL, text, IncomingAddon(text.substringAfterLast('/').ifEmpty { text }, Provider.URL.label, null), AddonManager.inspectZip(zip), gate)
             val folders = AddonManager.installZip(zip, AddonManager.addonsDir(gameRoot))
             val fingerprint = headerFingerprint(text) ?: "sha256:${sha256(zip)}"
             AddonSources.record(gameRoot, SourceRecord(Provider.URL, text, folders.first(), fingerprint, folders))
@@ -287,12 +306,12 @@ object AddonInstaller {
         }
     }
 
-    fun update(gameRoot: File, cacheDir: File, info: UpdateInfo, catalog: List<CatalogAddon>): List<String> {
+    fun update(gameRoot: File, cacheDir: File, info: UpdateInfo, catalog: List<CatalogAddon>, gate: OverlapGate = OverlapGate.ALWAYS): List<String> {
         val r = info.record
         return when (r.provider) {
-            Provider.GITHUB -> install(gameRoot, cacheDir, r.provider, r.id, r.name, GitHubProvider.latest(GitHubProvider.repoOfRecord(r.id)!!, r.assetName, r.version))
-            Provider.URL -> install(gameRoot, cacheDir, r.provider, r.id, r.name, RemoteFile(r.id, null, info.newVersion))
-            else -> installCatalog(gameRoot, cacheDir, catalog.first { it.key == "${r.provider.key}:${r.id}" })
+            Provider.GITHUB -> install(gameRoot, cacheDir, r.provider, r.id, r.name, GitHubProvider.latest(GitHubProvider.repoOfRecord(r.id)!!, r.assetName, r.version), gate)
+            Provider.URL -> install(gameRoot, cacheDir, r.provider, r.id, r.name, RemoteFile(r.id, null, info.newVersion), gate)
+            else -> installCatalog(gameRoot, cacheDir, catalog.first { it.key == "${r.provider.key}:${r.id}" }, gate)
         }
     }
 }

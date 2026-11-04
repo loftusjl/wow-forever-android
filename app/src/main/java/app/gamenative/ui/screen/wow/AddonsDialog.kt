@@ -75,6 +75,7 @@ import androidx.compose.ui.window.DialogProperties
 import app.gamenative.addons.AddonDetails
 import app.gamenative.addons.AddonInstaller
 import app.gamenative.addons.AddonManager
+import app.gamenative.addons.OverlapDeclined
 import app.gamenative.addons.AddonSites
 import app.gamenative.addons.AddonSources
 import app.gamenative.addons.GitHubProvider
@@ -177,6 +178,8 @@ private fun MyAddonsTab(gameRoot: File) {
     var records by remember { mutableStateOf(emptyList<SourceRecord>()) }
     var checking by remember { mutableStateOf(false) }
     val updating = remember { mutableStateListOf<String>() }
+    val asker = rememberOverlapAsker()
+    OverlapDialog(asker)
     // Up from the first row lands on "Check for updates" (which sends Up on to the tab), so those buttons stay reachable.
     val checkReq = remember { FocusRequester() }
     var detailFor by remember { mutableStateOf<Pair<InstalledAddon, SourceRecord?>?>(null) }
@@ -216,8 +219,10 @@ private fun MyAddonsTab(gameRoot: File) {
             for (info in list) {
                 updating.add(info.record.id)
                 try {
-                    withContext(Dispatchers.IO) { AddonInstaller.update(gameRoot, context.cacheDir, info, catalog) }
+                    withContext(Dispatchers.IO) { AddonInstaller.update(gameRoot, context.cacheDir, info, catalog, asker.gate) }
                     done.add(info)
+                } catch (e: OverlapDeclined) {
+                    failed.add("${info.record.name}: kept the installed copy")
                 } catch (e: Exception) {
                     failed.add("${info.record.name}: ${e.message}")
                 }
@@ -345,6 +350,8 @@ private fun ColumnScope.ImportTab(gameRoot: File) {
     val selected = remember { mutableStateListOf<String>() }
     var busy by remember { mutableStateOf(false) }
     var results by remember { mutableStateOf<List<ImportResult>?>(null) }
+    val asker = rememberOverlapAsker()
+    OverlapDialog(asker)
 
     fun rescan() {
         scope.launch {
@@ -448,7 +455,7 @@ private fun ColumnScope.ImportTab(gameRoot: File) {
                         val files = current.candidates.map { it.file }.filter { it.path in selected }
                         busy = true
                         scope.launch {
-                            results = withContext(Dispatchers.IO) { AddonManager.importFiles(gameRoot, files, deleteAfter) }
+                            results = withContext(Dispatchers.IO) { AddonManager.importFiles(gameRoot, files, deleteAfter, asker.gate) }
                             busy = false
                         }
                     },
